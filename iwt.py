@@ -60,8 +60,8 @@ class Modulation(nn.Module):
 class QKNorm(torch.nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        self.query_norm = nn.RMSNorm(dim)
-        self.key_norm = nn.RMSNorm(dim)
+        self.query_norm = nn.RMSNorm(dim, eps=1e-6)
+        self.key_norm = nn.RMSNorm(dim, eps=1e-6)
 
     def forward(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
         q = self.query_norm(q)
@@ -340,7 +340,7 @@ class Decoder(Base):
         )
         # TODO: x to w，分辨率无关，任意数变lw
         self.linear1 = nn.Linear(self.hidden_size, 1)
-        self.linear2 = nn.Linear(params.h * params.w / 4, params.lw)
+        self.linear2 = nn.Linear(params.h * params.w // 4, params.lw)
 
     def forward(self, x: Tensor, key: Tensor) -> Tensor:
         bs, c, h, w = x.shape
@@ -389,7 +389,6 @@ def main():
     iwt = IWT(params)
 
     x = torch.rand(bs, 3, params.h, params.w) * 2 - 1
-    # TODO: {0, 1} or {-0.5, 0.5}
     wm = torch.randint(0, 2, [bs, params.lw])
     key = torch.randint(0, 2, [bs, params.lk]) - 0.5
 
