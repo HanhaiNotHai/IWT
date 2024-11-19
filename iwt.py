@@ -57,6 +57,10 @@ class Modulation(nn.Module):
         return (ModulationOut(*out[:3]), ModulationOut(*out[3:]) if self.is_double else None)
 
 
+def modulate(x: Tensor, mod: ModulationOut) -> Tensor:
+    return (1 + mod.scale) * x + mod.shift
+
+
 class QKNorm(torch.nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -139,15 +143,13 @@ class DoubleStreamBlock(nn.Module):
         wm_mod1, wm_mod2 = self.wm_mod(key)
 
         # prepare x for attention
-        x_modulated = self.x_norm1(x)
-        x_modulated = (1 + x_mod1.scale) * x_modulated + x_mod1.shift
+        x_modulated = modulate(self.x_norm1(x), x_mod1)
         x_qkv = self.x_attn.qkv(x_modulated)
         x_q, x_k, x_v = rearrange(x_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         x_q, x_k = self.x_attn.norm(x_q, x_k, x_v)
 
         # prepare wm for attention
-        wm_modulated = self.wm_norm1(wm)
-        wm_modulated = (1 + wm_mod1.scale) * wm_modulated + wm_mod1.shift
+        wm_modulated = modulate(self.wm_norm1(wm), wm_mod1)
         wm_qkv = self.wm_attn.qkv(wm_modulated)
         wm_q, wm_k, wm_v = rearrange(wm_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         wm_q, wm_k = self.wm_attn.norm(wm_q, wm_k, wm_v)
@@ -162,13 +164,11 @@ class DoubleStreamBlock(nn.Module):
 
         # calculate the x bloks
         x = x + x_mod1.gate * self.x_attn.proj(s_attn)
-        x = x + x_mod2.gate * self.x_mlp((1 + x_mod2.scale) * self.x_norm2(x) + x_mod2.shift)
+        x = x + x_mod2.gate * self.x_mlp(modulate(self.x_norm2(x), x_mod2))
 
         # calculate the wm bloks
         wm = wm + wm_mod1.gate * self.wm_attn.proj(wm_attn)
-        wm = wm + wm_mod2.gate * self.wm_mlp(
-            (1 + wm_mod2.scale) * self.wm_norm2(wm) + wm_mod2.shift
-        )
+        wm = wm + wm_mod2.gate * self.wm_mlp(modulate(self.wm_norm2(wm), wm_mod2))
         return x, wm
 
 
@@ -200,7 +200,7 @@ class SingleStreamBlock(nn.Module):
 
     def forward(self, x: Tensor, key: Tensor, pe: Tensor) -> Tensor:
         mod, _ = self.modulation(key)
-        x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
+        x_mod = modulate(self.pre_norm(x), mod)
         qkv, mlp = torch.split(
             self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1
         )
