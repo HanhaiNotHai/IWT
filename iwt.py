@@ -274,8 +274,12 @@ class Base(nn.Module):
         self.key_in = nn.Linear(params.lk, self.hidden_size)
         self.pe_embedder = EmbedND(params.pe_dim, params.theta, params.axes_dim)
 
-    def forward(self, x: Tensor) -> Tensor:
-        return x
+    def get_ids(self, h: int, w: int, bs: int) -> Tensor:
+        ids = torch.zeros(h, w, 3)
+        ids[..., 1] = ids[..., 1] + torch.arange(h)[:, None]
+        ids[..., 2] = ids[..., 2] + torch.arange(w)[None, :]
+        ids = repeat(ids, 'h w c -> b (h w) c', b=bs)
+        return ids
 
 
 class Encoder(Base):
@@ -308,11 +312,8 @@ class Encoder(Base):
         wm = self.wm_in(wm)
         key = self.key_in(key)
 
-        x_ids = torch.zeros(h // 2, w // 2, 3)
-        x_ids[..., 1] = x_ids[..., 1] + torch.arange(h // 2)[:, None]
-        x_ids[..., 2] = x_ids[..., 2] + torch.arange(w // 2)[None, :]
-        x_ids = repeat(x_ids, "h w c -> b (h w) c", b=bs)
-        wm_ids = torch.zeros(bs, wm.shape[1], 3)
+        x_ids = self.get_ids(h // 2, w // 2, bs)
+        wm_ids = self.get_ids(int(wm.shape[1] ** 0.5), int(wm.shape[1] ** 0.5), bs)
         ids = torch.cat((wm_ids, x_ids), dim=1).to(x.device)
         pe = self.pe_embedder(ids)
 
@@ -349,10 +350,7 @@ class Decoder(Base):
         x = self.x_in(x)
         key = self.key_in(key)
 
-        ids = torch.zeros(h // 2, w // 2, 3)
-        ids[..., 1] = ids[..., 1] + torch.arange(h // 2)[:, None]
-        ids[..., 2] = ids[..., 2] + torch.arange(w // 2)[None, :]
-        ids = repeat(ids, "h w c -> b (h w) c", b=bs).to(x.device)
+        ids = self.get_ids(h // 2, w // 2, bs).to(x.device)
         pe = self.pe_embedder(ids)
 
         for block in self.single_blocks:
