@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from math import cos, pi
 from pathlib import Path
 from typing import Iterable
 
@@ -16,7 +17,7 @@ class TrainParams:
     lambda1: float = 2
     lambda2: float = 10
     lr: float = 1e-3
-    eta_min = 1e-6
+    lr_min = 1e-6
 
     img_size: int = 128
     lw: int = 64
@@ -33,6 +34,19 @@ class TrainParams:
             self.device = torch.device('mps')
         else:
             self.device = torch.device('cpu')
+
+
+def get_scheduler(
+    params: TrainParams, optimizer: torch.optim.Optimizer, epoch_max: int
+) -> torch.optim.lr_scheduler.LRScheduler:
+    coefficient = pi / epoch_max
+    b = params.lr_min / params.lr
+    w = (1 - b) / 2
+
+    def lr_lambda(epoch: int) -> float:
+        return (cos(epoch * coefficient) + 1) * w + b
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def to(batch: Iterable[Tensor], device: torch.device) -> tuple[Tensor, ...]:
@@ -52,10 +66,8 @@ def main():
     iwt = IWT(params.iwt_params).to(params.device)
 
     mse_loss = nn.MSELoss()
-    optimizer = torch.optim.Adam(iwt.parameters(), params.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=params.epochs * len(trainloader), eta_min=params.eta_min
-    )
+    optimizer = torch.optim.AdamW(iwt.parameters(), params.lr)
+    scheduler = get_scheduler(params, optimizer, params.epochs * len(trainloader))
 
     for epoch in range(params.epochs):
         for batch in trainloader:

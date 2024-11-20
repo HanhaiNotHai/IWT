@@ -6,6 +6,46 @@ from einops import rearrange, repeat
 from torch import Tensor, nn
 
 
+@dataclass
+class ModulationOut:
+    shift: Tensor
+    scale: Tensor
+    gate: Tensor
+
+
+class Modulation(nn.Module):
+
+    def __init__(self, dim: int, double: bool):
+        super().__init__()
+        self.is_double = double
+        self.multiplier = 6 if double else 3
+        self.lin = nn.Linear(dim, self.multiplier * dim)
+
+    __call__: Callable[[Tensor], tuple[ModulationOut, ModulationOut | None]]
+
+    def forward(self, key: Tensor) -> tuple[ModulationOut, ModulationOut | None]:
+        out = self.lin(nn.functional.silu(key))[:, None, :].chunk(self.multiplier, dim=-1)
+
+        return (ModulationOut(*out[:3]), ModulationOut(*out[3:]) if self.is_double else None)
+
+
+def modulate(x: Tensor, mod: ModulationOut) -> Tensor:
+    return (1 + mod.scale) * x + mod.shift
+
+
+class QKNorm(torch.nn.Module):
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.query_norm = nn.RMSNorm(dim, eps=1e-6)
+        self.key_norm = nn.RMSNorm(dim, eps=1e-6)
+
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        q = self.query_norm(q)
+        k = self.key_norm(k)
+        return q.to(v), k.to(v)
+
+
 def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
     assert dim % 2 == 0
     device = pos.device
@@ -35,40 +75,6 @@ class EmbedND(nn.Module):
         return emb.unsqueeze(1)
 
 
-@dataclass
-class ModulationOut:
-    shift: Tensor
-    scale: Tensor
-    gate: Tensor
-
-
-class Modulation(nn.Module):
-    def __init__(self, dim: int, double: bool):
-        super().__init__()
-        self.is_double = double
-        self.multiplier = 6 if double else 3
-        self.lin = nn.Linear(dim, self.multiplier * dim)
-
-    __call__: Callable[[Tensor], tuple[ModulationOut, ModulationOut | None]]
-
-    def forward(self, key: Tensor) -> tuple[ModulationOut, ModulationOut | None]:
-        out = self.lin(nn.functional.silu(key))[:, None, :].chunk(self.multiplier, dim=-1)
-
-        return (ModulationOut(*out[:3]), ModulationOut(*out[3:]) if self.is_double else None)
-
-
-class QKNorm(torch.nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.query_norm = nn.RMSNorm(dim, eps=1e-6)
-        self.key_norm = nn.RMSNorm(dim, eps=1e-6)
-
-    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
-        q = self.query_norm(q)
-        k = self.key_norm(k)
-        return q.to(v), k.to(v)
-
-
 def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
     xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
     xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
@@ -87,7 +93,8 @@ def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = False):
+
+    def __init__(self, dim: int, num_heads: int, qkv_bias: bool):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -106,12 +113,14 @@ class SelfAttention(nn.Module):
 
 
 class DoubleStreamBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False):
+
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool):
         super().__init__()
 
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.num_heads = num_heads
         self.hidden_size = hidden_size
+
         self.x_mod = Modulation(hidden_size, double=True)
         self.x_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.x_attn = SelfAttention(hidden_size, num_heads, qkv_bias)
@@ -139,15 +148,13 @@ class DoubleStreamBlock(nn.Module):
         wm_mod1, wm_mod2 = self.wm_mod(key)
 
         # prepare x for attention
-        x_modulated = self.x_norm1(x)
-        x_modulated = (1 + x_mod1.scale) * x_modulated + x_mod1.shift
+        x_modulated = modulate(self.x_norm1(x), x_mod1)
         x_qkv = self.x_attn.qkv(x_modulated)
         x_q, x_k, x_v = rearrange(x_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         x_q, x_k = self.x_attn.norm(x_q, x_k, x_v)
 
         # prepare wm for attention
-        wm_modulated = self.wm_norm1(wm)
-        wm_modulated = (1 + wm_mod1.scale) * wm_modulated + wm_mod1.shift
+        wm_modulated = modulate(self.wm_norm1(wm), wm_mod1)
         wm_qkv = self.wm_attn.qkv(wm_modulated)
         wm_q, wm_k, wm_v = rearrange(wm_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         wm_q, wm_k = self.wm_attn.norm(wm_q, wm_k, wm_v)
@@ -162,13 +169,11 @@ class DoubleStreamBlock(nn.Module):
 
         # calculate the x bloks
         x = x + x_mod1.gate * self.x_attn.proj(s_attn)
-        x = x + x_mod2.gate * self.x_mlp((1 + x_mod2.scale) * self.x_norm2(x) + x_mod2.shift)
+        x = x + x_mod2.gate * self.x_mlp(modulate(self.x_norm2(x), x_mod2))
 
         # calculate the wm bloks
         wm = wm + wm_mod1.gate * self.wm_attn.proj(wm_attn)
-        wm = wm + wm_mod2.gate * self.wm_mlp(
-            (1 + wm_mod2.scale) * self.wm_norm2(wm) + wm_mod2.shift
-        )
+        wm = wm + wm_mod2.gate * self.wm_mlp(modulate(self.wm_norm2(wm), wm_mod2))
         return x, wm
 
 
@@ -178,7 +183,7 @@ class SingleStreamBlock(nn.Module):
     https://arxiv.org/abs/2302.05442 and adapted modulation interface.
     """
 
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0):
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float):
         super().__init__()
         self.hidden_dim = hidden_size
         self.num_heads = num_heads
@@ -200,7 +205,7 @@ class SingleStreamBlock(nn.Module):
 
     def forward(self, x: Tensor, key: Tensor, pe: Tensor) -> Tensor:
         mod, _ = self.modulation(key)
-        x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
+        x_mod = modulate(self.pre_norm(x), mod)
         qkv, mlp = torch.split(
             self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1
         )
@@ -216,6 +221,7 @@ class SingleStreamBlock(nn.Module):
 
 
 class LastLayer(nn.Module):
+
     def __init__(self, hidden_size: int, patch_size: int, out_channels: int):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -223,13 +229,10 @@ class LastLayer(nn.Module):
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
 
     def forward(self, x: Tensor, key: Tensor) -> Tensor:
-        shift, scale = self.adaLN_modulation(key).chunk(2, dim=1)
-        x = (1 + scale[:, None, :]) * self.norm_final(x) + shift[:, None, :]
+        shift, scale = self.adaLN_modulation(key)[:, None, :].chunk(2, dim=-1)
+        x = modulate(self.norm_final(x), ModulationOut(scale, shift, None))
         x = self.linear(x)
         return x
-
-
-scale = 3
 
 
 @dataclass
@@ -239,9 +242,9 @@ class IWTParams:
     lw: int = 64
     lk: int = 32
     in_channels: int = 12
-    hidden_size: int = 3072 // scale
+    hidden_size: int = 512
     mlp_ratio: float = 4.0
-    num_heads: int = 24 // scale
+    num_heads: int = 4
     encoder_depth_double_blocks: int = 1
     encoder_depth_single_blocks: int = 2
     decoder_depth: int = 3
@@ -274,8 +277,12 @@ class Base(nn.Module):
         self.key_in = nn.Linear(params.lk, self.hidden_size)
         self.pe_embedder = EmbedND(params.pe_dim, params.theta, params.axes_dim)
 
-    def forward(self, x: Tensor) -> Tensor:
-        return x
+    def get_ids(self, h: int, w: int, bs: int) -> Tensor:
+        ids = torch.zeros(h, w, 3)
+        ids[..., 1] = ids[..., 1] + torch.arange(h)[:, None]
+        ids[..., 2] = ids[..., 2] + torch.arange(w)[None, :]
+        ids = repeat(ids, 'h w c -> b (h w) c', b=bs)
+        return ids
 
 
 class Encoder(Base):
@@ -308,11 +315,8 @@ class Encoder(Base):
         wm = self.wm_in(wm)
         key = self.key_in(key)
 
-        x_ids = torch.zeros(h // 2, w // 2, 3)
-        x_ids[..., 1] = x_ids[..., 1] + torch.arange(h // 2)[:, None]
-        x_ids[..., 2] = x_ids[..., 2] + torch.arange(w // 2)[None, :]
-        x_ids = repeat(x_ids, "h w c -> b (h w) c", b=bs)
-        wm_ids = torch.zeros(bs, wm.shape[1], 3)
+        x_ids = self.get_ids(h // 2, w // 2, bs)
+        wm_ids = self.get_ids(int(wm.shape[1] ** 0.5), int(wm.shape[1] ** 0.5), bs)
         ids = torch.cat((wm_ids, x_ids), dim=1).to(x.device)
         pe = self.pe_embedder(ids)
 
@@ -338,7 +342,7 @@ class Decoder(Base):
             SingleStreamBlock(self.hidden_size, self.num_heads, params.mlp_ratio)
             for _ in range(params.decoder_depth)
         )
-        # TODO: x to w，分辨率无关，任意数变lw
+        # TODO: x[bs, h / ph * w / pw, hidden_size] to wm[bs, lw]，分辨率无关，任意数变lw
         self.linear1 = nn.Linear(self.hidden_size, 1)
         self.linear2 = nn.Linear(params.h * params.w // 4, params.lw)
 
@@ -349,10 +353,7 @@ class Decoder(Base):
         x = self.x_in(x)
         key = self.key_in(key)
 
-        ids = torch.zeros(h // 2, w // 2, 3)
-        ids[..., 1] = ids[..., 1] + torch.arange(h // 2)[:, None]
-        ids[..., 2] = ids[..., 2] + torch.arange(w // 2)[None, :]
-        ids = repeat(ids, "h w c -> b (h w) c", b=bs).to(x.device)
+        ids = self.get_ids(h // 2, w // 2, bs).to(x.device)
         pe = self.pe_embedder(ids)
 
         for block in self.single_blocks:
