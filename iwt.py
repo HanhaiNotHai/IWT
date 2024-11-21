@@ -311,6 +311,7 @@ class Encoder(Base):
 
     def forward(self, x: Tensor, wm: Tensor, key: Tensor) -> Tensor:
         bs, c, h, w = x.shape
+        res = x
 
         x = rearrange(
             x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=self.patch_size, pw=self.patch_size
@@ -341,6 +342,7 @@ class Encoder(Base):
             ph=self.patch_size,
             pw=self.patch_size,
         )
+        x = x + res
         return x
 
 
