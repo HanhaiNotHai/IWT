@@ -1,6 +1,8 @@
 .DS_Store
 .vscode
 dataset
+log
+checkpoint
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

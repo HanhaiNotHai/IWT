@@ -2,6 +2,7 @@ import os
 from dataclasses import dataclass
 from math import cos, pi
 from pathlib import Path
+from time import strftime
 from typing import Iterable
 
 import torch
@@ -21,8 +22,7 @@ class TrainParams:
     # Use wandb or not.
     WANDB: bool = False
 
-    bs: int = 12
-    valid_bs: int = 24
+    bs: int = 8
     epochs: int = 10
     lambda1: float = 2
     lambda2: float = 10
@@ -35,10 +35,14 @@ class TrainParams:
 
     train_root: str | Path = 'dataset/DIV2K/DIV2K_train_LR_x8'
     valid_root: str | Path = 'dataset/DIV2K/DIV2K_valid_LR_x8'
-    ckpt_root: str | Path = 'checkpiont'
+    ckpt_root: str | Path = 'checkpoint'
 
     def __post_init__(self):
         self.iwt_params = IWTParams(h=self.img_size, w=self.img_size, lw=self.lw, lk=self.lk)
+
+        self.ckpt_root = os.path.join(self.ckpt_root, strftime('%m%d_%X/'))
+        os.makedirs(self.ckpt_root)
+
         if torch.cuda.is_available():
             self.device = torch.device('cuda')
         elif torch.mps.is_available():
@@ -86,7 +90,7 @@ def main():
     trainloader = torch.utils.data.DataLoader(
         trainset, batch_size=params.bs, shuffle=True, pin_memory=True
     )
-    validloader = torch.utils.data.DataLoader(validset, batch_size=params.valid_bs)
+    validloader = torch.utils.data.DataLoader(validset, batch_size=params.bs)
 
     iwt = IWT(params.iwt_params).to(params.device)
 
@@ -98,8 +102,8 @@ def main():
 
     if params.WANDB:
         wandb.login()
-        wandb.init(project='iwt', dir='wandb_log', config=params.wandb_config)
-        wandb.watch(iwt, log='all')
+        wandb.init(project='iwt', dir='./log', config=params.wandb_config)
+        wandb.watch(iwt, log='all', log_freq=10)
 
     step = 0
     with trange(params.epochs, desc='epoch') as epoch_pbar:
@@ -140,7 +144,7 @@ def main():
                         evaluator.update(x_encoded, img, wm_decoded, wm)
                 iwt.train()
             metrics = evaluator.compute()
-            wandb.log(metrics, epoch) if params.WANDB else None
+            wandb.log(metrics, step) if params.WANDB else None
             epoch_pbar.set_postfix(metrics)
             torch.save(
                 iwt.state_dict(), os.path.join(params.ckpt_root, f'iwt_{epoch}_{metrics}.ckpt')
