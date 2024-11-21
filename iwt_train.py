@@ -7,12 +7,13 @@ import torch
 from torch import Tensor, nn
 
 from iwt import IWT, IWTParams
-from util.dataset import Dataset
+from util.dataset import TrainDataset, ValidDataset
+from util.evaluator import Evaluator
 
 
 @dataclass
 class TrainParams:
-    bs: int = 4
+    bs: int = 8
     epochs: int = 10
     lambda1: float = 2
     lambda2: float = 10
@@ -56,8 +57,8 @@ def to(batch: Iterable[Tensor], device: torch.device) -> tuple[Tensor, ...]:
 def main():
     params = TrainParams()
 
-    trainset = Dataset(params.train_root, params.img_size, params.lw, params.lk)
-    validset = Dataset(params.valid_root, params.img_size, params.lw, params.lk)
+    trainset = TrainDataset(params.train_root, params.img_size, params.lw, params.lk)
+    validset = ValidDataset(params.valid_root, params.img_size, params.lw, params.lk)
     trainloader = torch.utils.data.DataLoader(
         trainset, batch_size=params.bs, shuffle=True, pin_memory=True
     )
@@ -69,6 +70,8 @@ def main():
     optimizer = torch.optim.AdamW(iwt.parameters(), params.lr)
     scheduler = get_scheduler(params, optimizer, params.epochs * len(trainloader))
 
+    evaluator = Evaluator(params.device)
+
     for epoch in range(params.epochs):
         for batch in trainloader:
             x, wm, key = to(batch, params.device)
@@ -77,13 +80,24 @@ def main():
 
             x_encoded, wm_decoded = iwt(x, wm, key)
 
-            loss1 = mse_loss(x, x_encoded)
-            loss2 = mse_loss(wm - 0.5, wm_decoded)
+            loss1 = mse_loss(x_encoded, x)
+            loss2 = mse_loss(wm_decoded, wm - 0.5)
             loss: Tensor = params.lambda1 * loss1 + params.lambda2 * loss2
 
             loss.backward()
             optimizer.step()
             scheduler.step()
+
+        iwt.eval()
+        evaluator.reset()
+        with torch.inference_mode():
+            for batch in validloader:
+                img, x, wm, key = to(batch, params.device)
+                x_encoded, wm_decoded = iwt(x, wm, key)
+                evaluator.update(x_encoded, img, wm_decoded, wm)
+        psnr, acc = evaluator.compute()
+        print(f'epoch: {epoch}, psnr: {psnr}, acc: {acc}')
+        iwt.train()
 
 
 if __name__ == '__main__':
