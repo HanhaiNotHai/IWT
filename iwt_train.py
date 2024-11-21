@@ -7,7 +7,7 @@ import torch
 from torch import Tensor, nn
 
 from iwt import IWT, IWTParams
-from util.dataset import Dataset
+from util.dataset import TrainDataset, ValidDataset
 
 
 @dataclass
@@ -56,8 +56,8 @@ def to(batch: Iterable[Tensor], device: torch.device) -> tuple[Tensor, ...]:
 def main():
     params = TrainParams()
 
-    trainset = Dataset(params.train_root, params.img_size, params.lw, params.lk)
-    validset = Dataset(params.valid_root, params.img_size, params.lw, params.lk)
+    trainset = TrainDataset(params.train_root, params.img_size, params.lw, params.lk)
+    validset = ValidDataset(params.valid_root, params.img_size, params.lw, params.lk)
     trainloader = torch.utils.data.DataLoader(
         trainset, batch_size=params.bs, shuffle=True, pin_memory=True
     )
