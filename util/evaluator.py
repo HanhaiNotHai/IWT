@@ -31,8 +31,8 @@ class Evaluator:
         self.acc.update(wm_decoded.flatten(), wm.flatten())
 
     @torch.inference_mode()
-    def compute(self) -> tuple[Tensor, Tensor]:
-        return self.psnr.compute(), self.acc.compute()
+    def compute(self) -> dict[str, float]:
+        return dict(psnr=self.psnr.compute().item(), acc=self.acc.compute().item())
 
 
 def main():

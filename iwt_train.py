@@ -1,10 +1,13 @@
+import os
 from dataclasses import dataclass
 from math import cos, pi
 from pathlib import Path
 from typing import Iterable
 
 import torch
+import wandb
 from torch import Tensor, nn
+from tqdm import tqdm, trange
 
 from iwt import IWT, IWTParams
 from util.dataset import TrainDataset, ValidDataset
@@ -13,7 +16,13 @@ from util.evaluator import Evaluator
 
 @dataclass
 class TrainParams:
-    bs: int = 8
+    # Set proxy if you are using.
+    proxy: str | None = None  # '127.0.0.1:7897'
+    # Use wandb or not.
+    WANDB: bool = False
+
+    bs: int = 12
+    valid_bs: int = 24
     epochs: int = 10
     lambda1: float = 2
     lambda2: float = 10
@@ -26,6 +35,7 @@ class TrainParams:
 
     train_root: str | Path = 'dataset/DIV2K/DIV2K_train_LR_x8'
     valid_root: str | Path = 'dataset/DIV2K/DIV2K_valid_LR_x8'
+    ckpt_root: str | Path = 'checkpiont'
 
     def __post_init__(self):
         self.iwt_params = IWTParams(h=self.img_size, w=self.img_size, lw=self.lw, lk=self.lk)
@@ -35,6 +45,20 @@ class TrainParams:
             self.device = torch.device('mps')
         else:
             self.device = torch.device('cpu')
+
+        if self.proxy is not None:
+            os.environ['http_proxy'] = os.environ['https_proxy'] = self.proxy
+
+    @property
+    def wandb_config(self) -> dict:
+        return dict(
+            batch_size=self.bs,
+            epochs=self.epochs,
+            lambda1=self.lambda1,
+            lambda2=self.lambda2,
+            lr=self.lr,
+            lr_min=self.lr_min,
+        )
 
 
 def get_scheduler(
@@ -62,7 +86,7 @@ def main():
     trainloader = torch.utils.data.DataLoader(
         trainset, batch_size=params.bs, shuffle=True, pin_memory=True
     )
-    validloader = torch.utils.data.DataLoader(validset, batch_size=params.bs)
+    validloader = torch.utils.data.DataLoader(validset, batch_size=params.valid_bs)
 
     iwt = IWT(params.iwt_params).to(params.device)
 
@@ -72,32 +96,57 @@ def main():
 
     evaluator = Evaluator(params.device)
 
-    for epoch in range(params.epochs):
-        for batch in trainloader:
-            x, wm, key = to(batch, params.device)
+    if params.WANDB:
+        wandb.login()
+        wandb.init(project='iwt', dir='wandb_log', config=params.wandb_config)
+        wandb.watch(iwt, log='all')
 
-            optimizer.zero_grad()
+    step = 0
+    with trange(params.epochs, desc='epoch') as epoch_pbar:
+        for epoch in epoch_pbar:
+            with tqdm(trainloader, desc='train', leave=False) as train_pbar:
+                for batch in train_pbar:
+                    step += 1
+                    x, wm, key = to(batch, params.device)
 
-            x_encoded, wm_decoded = iwt(x, wm, key)
+                    optimizer.zero_grad()
 
-            loss1 = mse_loss(x_encoded, x)
-            loss2 = mse_loss(wm_decoded, wm - 0.5)
-            loss: Tensor = params.lambda1 * loss1 + params.lambda2 * loss2
+                    x_encoded, wm_decoded = iwt(x, wm, key)
 
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
+                    loss1: Tensor = mse_loss(x_encoded, x)
+                    loss2: Tensor = mse_loss(wm_decoded, wm - 0.5)
+                    loss = params.lambda1 * loss1 + params.lambda2 * loss2
 
-        iwt.eval()
-        evaluator.reset()
-        with torch.inference_mode():
-            for batch in validloader:
-                img, x, wm, key = to(batch, params.device)
-                x_encoded, wm_decoded = iwt(x, wm, key)
-                evaluator.update(x_encoded, img, wm_decoded, wm)
-        psnr, acc = evaluator.compute()
-        print(f'epoch: {epoch}, psnr: {psnr}, acc: {acc}')
-        iwt.train()
+                    data = dict(
+                        loss1=loss1.item(),
+                        loss2=loss2.item(),
+                        loss=loss.item(),
+                        lr=scheduler.get_last_lr()[0],
+                    )
+                    wandb.log(data, step) if params.WANDB else None
+                    train_pbar.set_postfix(data)
+
+                    loss.backward()
+                    optimizer.step()
+                    scheduler.step()
+
+            evaluator.reset()
+            with torch.inference_mode():
+                iwt.eval()
+                with tqdm(validloader, desc='valid', leave=False) as valid_pbar:
+                    for batch in valid_pbar:
+                        img, x, wm, key = to(batch, params.device)
+                        x_encoded, wm_decoded = iwt(x, wm, key)
+                        evaluator.update(x_encoded, img, wm_decoded, wm)
+                iwt.train()
+            metrics = evaluator.compute()
+            wandb.log(metrics, epoch) if params.WANDB else None
+            epoch_pbar.set_postfix(metrics)
+            torch.save(
+                iwt.state_dict(), os.path.join(params.ckpt_root, f'iwt_{epoch}_{metrics}.ckpt')
+            )
+
+    wandb.finish() if params.WANDB else None
 
 
 if __name__ == '__main__':
