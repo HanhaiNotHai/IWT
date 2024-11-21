@@ -37,8 +37,8 @@ class TrainDataset(Dataset):
     def __getitem__(self, index) -> tuple[Tensor, Tensor, Tensor]:
         return (
             self.data[index],
-            torch.randint(0, 2, [self.lw]),
-            torch.randint(0, 2, [self.lk]) - 0.5,
+            torch.randint(0, 2, [self.lw], dtype=torch.int32),
+            torch.randint(0, 2, [self.lk], dtype=torch.uint8) - 0.5,
         )
 
 
@@ -48,8 +48,8 @@ class ValidDataset(Dataset):
         return (
             self.imgs[index],
             self.data[index],
-            torch.randint(0, 2, [self.lw]),
-            torch.randint(0, 2, [self.lk]) - 0.5,
+            torch.randint(0, 2, [self.lw], dtype=torch.int32),
+            torch.randint(0, 2, [self.lk], dtype=torch.uint8) - 0.5,
         )
 
 

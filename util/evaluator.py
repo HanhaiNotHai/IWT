@@ -43,7 +43,7 @@ def main():
     x_encoded[0] *= 0.99
     x_encoded[1] *= 0.95
 
-    wm = torch.randint(0, 2, [2, 64])
+    wm = torch.randint(0, 2, [2, 64], dtype=torch.int32)
     wm_decoded = torch.rand(2, 64) * 2 - 1
 
     evaluator = Evaluator()
