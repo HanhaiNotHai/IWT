@@ -225,7 +225,7 @@ class LastLayer(nn.Module):
     def __init__(self, hidden_size: int, patch_size: int, out_channels: int):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels)
+        self.linear = nn.Linear(hidden_size, patch_size**2 * out_channels)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
 
     def forward(self, x: Tensor, key: Tensor) -> Tensor:
@@ -241,7 +241,8 @@ class IWTParams:
     w: int = 128
     lw: int = 64
     lk: int = 32
-    in_channels: int = 12
+    in_channels: int = 3
+    patch_size: int = 2
     hidden_size: int = 512
     mlp_ratio: float = 4.0
     num_heads: int = 4
@@ -269,10 +270,11 @@ class Base(nn.Module):
 
         self.in_channels = params.in_channels
         self.out_channels = self.in_channels
+        self.patch_size = params.patch_size
         self.hidden_size = params.hidden_size
         self.num_heads = params.num_heads
 
-        self.x_in = nn.Linear(self.in_channels, self.hidden_size)
+        self.x_in = nn.Linear(self.in_channels * self.patch_size**2, self.hidden_size)
         # TODO: key变1位，变化要大
         self.key_in = nn.Linear(params.lk, self.hidden_size)
         self.pe_embedder = EmbedND(params.pe_dim, params.theta, params.axes_dim)
@@ -305,17 +307,19 @@ class Encoder(Base):
             SingleStreamBlock(self.hidden_size, self.num_heads, params.mlp_ratio)
             for _ in range(params.encoder_depth_single_blocks)
         )
-        self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
+        self.final_layer = LastLayer(self.hidden_size, self.patch_size, self.out_channels)
 
     def forward(self, x: Tensor, wm: Tensor, key: Tensor) -> Tensor:
         bs, c, h, w = x.shape
 
-        x = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+        x = rearrange(
+            x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=self.patch_size, pw=self.patch_size
+        )
         x = self.x_in(x)
         wm = self.wm_in(wm)
         key = self.key_in(key)
 
-        x_ids = self.get_ids(h // 2, w // 2, bs)
+        x_ids = self.get_ids(h // self.patch_size, w // self.patch_size, bs)
         wm_ids = self.get_ids(int(wm.shape[1] ** 0.5), int(wm.shape[1] ** 0.5), bs)
         ids = torch.cat((wm_ids, x_ids), dim=1).to(x.device)
         pe = self.pe_embedder(ids)
@@ -329,7 +333,14 @@ class Encoder(Base):
         x = x[:, wm.shape[1] :, ...]
 
         x = self.final_layer(x, key)  # (N, T, patch_size ** 2 * out_channels)
-        x = rearrange(x, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h // 2, w=w // 2, ph=2, pw=2)
+        x = rearrange(
+            x,
+            "b (h w) (c ph pw) -> b c (h ph) (w pw)",
+            h=h // self.patch_size,
+            w=w // self.patch_size,
+            ph=self.patch_size,
+            pw=self.patch_size,
+        )
         return x
 
 
@@ -344,16 +355,18 @@ class Decoder(Base):
         )
         # TODO: x[bs, h / ph * w / pw, hidden_size] to wm[bs, lw]，分辨率无关，任意数变lw
         self.linear1 = nn.Linear(self.hidden_size, 1)
-        self.linear2 = nn.Linear(params.h * params.w // 4, params.lw)
+        self.linear2 = nn.Linear(params.h * params.w // self.patch_size**2, params.lw)
 
     def forward(self, x: Tensor, key: Tensor) -> Tensor:
         bs, c, h, w = x.shape
 
-        x = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+        x = rearrange(
+            x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=self.patch_size, pw=self.patch_size
+        )
         x = self.x_in(x)
         key = self.key_in(key)
 
-        ids = self.get_ids(h // 2, w // 2, bs).to(x.device)
+        ids = self.get_ids(h // self.patch_size, w // self.patch_size, bs).to(x.device)
         pe = self.pe_embedder(ids)
 
         for block in self.single_blocks:
